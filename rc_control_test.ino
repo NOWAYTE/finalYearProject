@@ -1,36 +1,11 @@
-nclude "esp_camera.h"
+#include "esp_camera.h"
 #include <WiFi.h>
-
-//
-// WARNING!!! PSRAM IC required for UXGA resolution and high JPEG quality
-//            Ensure ESP32 Wrover Module or other board with PSRAM is selected
-//            Partial images will be transmitted if image exceeds buffer size
-//
-//            You must select partition scheme from the board menu that has at least 3MB APP space.
-//            Face Recognition is DISABLED for ESP32 and ESP32-S2, because it takes up from 15
-//            seconds to process single frame. Face Detection is ENABLED if PSRAM is enabled as well
+#include <WebSocketsServer.h>
 
 // ===================
 // Select camera model
 // ===================
-//#define CAMERA_MODEL_WROVER_KIT // Has PSRAM
-// #define CAMERA_MODEL_ESP_EYE  // Has PSRAM
-//#define CAMERA_MODEL_ESP32S3_EYE // Has PSRAM
-//#define CAMERA_MODEL_M5STACK_PSRAM // Has PSRAM
-//#define CAMERA_MODEL_M5STACK_V2_PSRAM // M5Camera version B Has PSRAM
-//#define CAMERA_MODEL_M5STACK_WIDE // Has PSRAM
-//#define CAMERA_MODEL_M5STACK_ESP32CAM // No PSRAM
-//#define CAMERA_MODEL_M5STACK_UNITCAM // No PSRAM
-//#define CAMERA_MODEL_M5STACK_CAMS3_UNIT  // Has PSRAM
-#define CAMERA_MODEL_AI_THINKER// Has PSRAM
-//#define CAMERA_MODEL_TTGO_T_JOURNAL // No PSRAM
-//#define CAMERA_MODEL_XIAO_ESP32S3 // Has PSRAM
-// ** Espressif Internal Boards **
-//#define CAMERA_MODEL_ESP32_CAM_BOARD
-//#define CAMERA_MODEL_ESP32S2_CAM_BOARD
-//#define CAMERA_MODEL_ESP32S3_CAM_LCD
-//#define CAMERA_MODEL_DFRobot_FireBeetle2_ESP32S3 // Has PSRAM
-//#define CAMERA_MODEL_DFRobot_Romeo_ESP32S3 // Has PSRAM
+#define CAMERA_MODEL_AI_THINKER  // Has PSRAM
 #include "camera_pins.h"
 
 // ===========================
@@ -38,6 +13,20 @@ nclude "esp_camera.h"
 // ===========================
 const char *ssid = "SNOWAYTE";
 const char *password = "KUT00042";
+
+// ===========================
+// Ultrasonic sensor pins
+// ===========================
+#define TRIG_PIN 12   // Adjust if needed – ensure this pin is free
+#define ECHO_PIN 13   // Adjust if needed – ensure this pin is free
+
+WebSocketsServer webSocket = WebSocketsServer(81);
+
+void onWebSocketEvent(uint8_t num, WStype_t type, uint8_t *payload, size_t length) {
+    if (type == WStype_DISCONNECTED) {
+        Serial.printf("[%u] Disconnected!\n", num);
+    }
+}
 
 void startCameraServer();
 void setupLedFlash(int pin);
@@ -47,6 +36,11 @@ void setup() {
   Serial.setDebugOutput(true);
   Serial.println();
 
+  // Setup ultrasonic sensor pins
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+
+  // Camera configuration
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer = LEDC_TIMER_0;
@@ -69,14 +63,12 @@ void setup() {
   config.xclk_freq_hz = 20000000;
   config.frame_size = FRAMESIZE_UXGA;
   config.pixel_format = PIXFORMAT_JPEG;  // for streaming
-  //config.pixel_format = PIXFORMAT_RGB565; // for face detection/recognition
   config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
   config.fb_location = CAMERA_FB_IN_PSRAM;
   config.jpeg_quality = 12;
   config.fb_count = 1;
 
-  // if PSRAM IC present, init with UXGA resolution and higher JPEG quality
-  //                      for larger pre-allocated frame buffer.
+  // If PSRAM IC present, adjust settings for higher quality
   if (config.pixel_format == PIXFORMAT_JPEG) {
     if (psramFound()) {
       config.jpeg_quality = 10;
@@ -100,7 +92,7 @@ void setup() {
   pinMode(14, INPUT_PULLUP);
 #endif
 
-  // camera init
+  // Camera initialization
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
     Serial.printf("Camera init failed with error 0x%x", err);
@@ -108,13 +100,13 @@ void setup() {
   }
 
   sensor_t *s = esp_camera_sensor_get();
-  // initial sensors are flipped vertically and colors are a bit saturated
+  // Adjust sensor settings if necessary
   if (s->id.PID == OV3660_PID) {
     s->set_vflip(s, 1);        // flip it back
-    s->set_brightness(s, 1);   // up the brightness just a bit
+    s->set_brightness(s, 1);   // increase brightness a bit
     s->set_saturation(s, -2);  // lower the saturation
   }
-  // drop down frame size for higher initial frame rate
+  // Drop down frame size for higher initial frame rate
   if (config.pixel_format == PIXFORMAT_JPEG) {
     s->set_framesize(s, FRAMESIZE_QVGA);
   }
@@ -128,14 +120,14 @@ void setup() {
   s->set_vflip(s, 1);
 #endif
 
-// Setup LED FLash if LED pin is defined in camera_pins.h
+// Setup LED flash if defined
 #if defined(LED_GPIO_NUM)
   setupLedFlash(LED_GPIO_NUM);
 #endif
 
+  // Connect to WiFi
   WiFi.begin(ssid, password);
   WiFi.setSleep(false);
-
   Serial.print("WiFi connecting");
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
@@ -144,15 +136,48 @@ void setup() {
   Serial.println("");
   Serial.println("WiFi connected");
 
+  // Start the camera server for streaming
   startCameraServer();
 
   Serial.print("Camera Ready! Use 'http://");
   Serial.print(WiFi.localIP());
   Serial.println("' to connect");
+
+  webSocket.begin();
+  webSocket.onEvent(onWebSocketEvent);
 }
 
 void loop() {
-  // Do nothing. Everything is done in another task by the web server
-  delay(10000);
+  // Measure the ultrasonic sensor every second
+  long duration;
+  float distance;
+
+  webSocket.begin();
+  webSocket.onEvent(onWebSocketEvent);
+
+  // Trigger the ultrasonic sensor
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  duration = pulseIn(ECHO_PIN, HIGH);
+  distance = (duration * 0.0343) / 2;  // Convert pulse duration to distance in cm
+
+  static uint32_t last_update = 0;
+  if (millis() - last_update > 500) {
+    last_update = millis();
+    String json = "{\"distance\":" + String(distance, 1) + "}";
+    webSocket.broadcastTXT(json);
+  }  // Added missing closing brace for the if block
+
+  Serial.print("Ultrasonic Distance: ");
+  Serial.print(distance);
+  Serial.println(" cm");
+
+  delay(1000);  // Read sensor once per second
 }
+
+
 

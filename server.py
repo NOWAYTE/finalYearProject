@@ -1,74 +1,72 @@
-import socketserver
-import http.server
-import cv2
+from flask import Flask, request, Response, render_template_string
 import numpy as np
-import urllib.request
-from urllib.parse import urlparse, parse_qs
+import cv2
 import threading
 import time
 
-ESP32_CAM_URL = "http://192.168.1.101:81/stream"
-sensor_data = None
-car_stopped = False
-lock = threading.Lock()  # For thread-safe variable access
+app = Flask(__name__)
 
-class SensorDataHandler(http.server.BaseHTTPRequestHandler):
-    def do_GET(self):
-        global sensor_data, car_stopped
-        if self.path.startswith("/sensor"):
-            try:
-                query = urlparse(self.path).query
-                params = parse_qs(query)
-                distance = float(params.get('distance', [0])[0])
-                
-                with lock:
-                    sensor_data = distance
-                    print(f"Distance: {sensor_data} cm")
+# Global variable to store the latest frame and a lock for thread safety
+latest_frame = None
+frame_lock = threading.Lock()
 
-                    if sensor_data < 20 and not car_stopped:
-                        print("Stopping car...")
-                        car_stopped = True
-                        # Implement car stop command
+@app.route('/upload', methods=['POST'])
+def upload():
+    global latest_frame
+    # Convert the incoming JPEG byte stream to a numpy array
+    img_array = np.frombuffer(request.data, dtype=np.uint8)
+    # Decode the image using OpenCV
+    frame = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+    
+    if frame is not None:
+        with frame_lock:
+            latest_frame = frame
+        return "Frame received", 200
+    else:
+        return "Invalid frame", 400
 
-                    elif sensor_data >= 20 and car_stopped:
-                        print("Resuming car...")
-                        car_stopped = False
-                        # Implement car resume command
-
-                self.send_response(200)
-                self.end_headers()
-                self.wfile.write(b"OK")
-            except Exception as e:
-                print(f"Error: {e}")
-                self.send_response(500)
-                self.end_headers()
-
-def stream_video():
-    # Improved MJPEG stream handling
-    stream = urllib.request.urlopen(ESP32_CAM_URL)
-    bytes = b''
+def generate_frames():
+    global latest_frame
     while True:
-        bytes += stream.read(1024)
-        a = bytes.find(b'\xff\xd8')
-        b = bytes.find(b'\xff\xd9')
-        if a != -1 and b != -1:
-            jpg = bytes[a:b+2]
-            bytes = bytes[b+2:]
-            frame = cv2.imdecode(np.frombuffer(jpg, dtype=np.uint8), cv2.IMREAD_COLOR)
-            if frame is not None:
-                cv2.imshow('ESP32-CAM Stream', frame)
-            if cv2.waitKey(1) == ord('q'):
-                break
-    cv2.destroyAllWindows()
+        with frame_lock:
+            if latest_frame is None:
+                # Wait for a frame to be available
+                time.sleep(0.1)
+                continue
+            # Encode the frame as JPEG
+            ret, buffer = cv2.imencode('.jpg', latest_frame)
+        if not ret:
+            continue
+        frame = buffer.tobytes()
+        # Yield the frame in the multipart MJPEG format
+        yield (b'--frame\r\n'
+               b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+        time.sleep(0.1)  # Adjust this delay to control the stream frame rate
 
-def run_http_server():
-    server = socketserver.TCPServer(("0.0.0.0", 8002), SensorDataHandler)
-    print("Server started on port 8002")
-    server.serve_forever()
+@app.route('/video_feed')
+def video_feed():
+    # Stream the MJPEG frames
+    return Response(generate_frames(),
+                    mimetype='multipart/x-mixed-replace; boundary=frame')
 
-if __name__ == "__main__":
-    threading.Thread(target=run_http_server, daemon=True).start()
-    threading.Thread(target=stream_video, daemon=True).start()
-    # Keep main thread alive
-    while True:
-        time.sleep(1)
+@app.route('/')
+def index():
+    # A simple HTML page to display the MJPEG stream
+    html = '''
+    <!doctype html>
+    <html>
+      <head>
+        <title>ESP32 Video Stream</title>
+      </head>
+      <body>
+        <h1>Live Stream from ESP32 Camera</h1>
+        <img src="/video_feed" width="640" height="480">
+      </body>
+    </html>
+    '''
+    return render_template_string(html)
+
+if __name__ == '__main__':
+    # Run the Flask server on all network interfaces at port 5000
+    app.run(host='0.0.0.0', port=5000, debug=True)
+

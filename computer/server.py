@@ -44,6 +44,19 @@ frame_lock = threading.Lock()
 #     processed_frame = cv2.addWeighted(frame, 0.8, lane_image, 1, 1)
 #     return processed_frame
 
+# In Flask app.py
+steering_data = {"angle": 0, "speed": 0}
+
+@app.route('/set_steering', methods=['POST'])
+def set_steering():
+    global steering_data
+    steering_data = request.get_json()
+    return "OK", 200
+
+@app.route('/get_steering')
+def get_steering():
+    return jsonify(steering_data)
+
 def detect_lanes(frame):
     """Lane detection with full diagnostic overlay"""
     height, width = frame.shape[:2]
@@ -68,7 +81,7 @@ def detect_lanes(frame):
     status_y += line_spacing
 
     # --- Stage 3: ROI Mask Application ---
-    roi_vertices = np.array([[
+    roi_vertices = np.array([[ 
         (int(width * 0.1), height),
         (int(width * 0.9), height),
         (int(width * 0.6), int(height * 0.6)),
@@ -88,7 +101,7 @@ def detect_lanes(frame):
     masked_edges = cv2.bitwise_and(edges, mask)
     
     lines = cv2.HoughLinesP(masked_edges, 2, np.pi/180, 50, 
-                           minLineLength=40, maxLineGap=20)
+                            minLineLength=40, maxLineGap=20)
     
     line_count = len(lines) if lines is not None else 0
     cv2.putText(debug_frame, f"Hough lines found: {line_count}",
@@ -102,29 +115,32 @@ def detect_lanes(frame):
     if lines is not None:
         for line in lines:
             x1, y1, x2, y2 = line[0]
-            if x2 == x1: continue  # Avoid division by zero
+            if x2 == x1: 
+                continue  # Avoid division by zero
             slope = (y2 - y1) / (x2 - x1)
             
-            # Classify left/right lanes
-            if slope < -0.5:  # Left lane (negative slope)
+            # Classify left/right lanes based on slope
+            if slope < -0.5:  # Likely a left lane
                 left_lines.append(line[0])
-            elif slope > 0.5:  # Right lane (positive slope)
+            elif slope > 0.5:  # Likely a right lane
                 right_lines.append(line[0])
 
     cv2.putText(debug_frame, 
                 f"Left lines: {len(left_lines)} | Right lines: {len(right_lines)}",
                 (10, status_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                (0, 255, 0) if len(left_lines)+len(right_lines)>0 else (0,0,255), 2)
+                (0, 255, 0) if (len(left_lines)+len(right_lines)) > 0 else (0,0,255), 2)
     status_y += line_spacing
 
     # --- Stage 6: Lane Averaging ---
     def average_lines(lines, y_min, y_max):
-        if not lines: return None
+        if not lines:
+            return None
+        # Combine all line points
         x = np.concatenate([[x1, x2] for x1, y1, x2, y2 in lines])
         y = np.concatenate([[y1, y2] for x1, y1, x2, y2 in lines])
         try:
             coeffs = np.polyfit(y, x, 1)
-        except:
+        except Exception as e:
             return None
         x_min = int(coeffs[0] * y_min + coeffs[1])
         x_max = int(coeffs[0] * y_max + coeffs[1])
@@ -139,9 +155,9 @@ def detect_lanes(frame):
     lane_status = "No lanes"
     if avg_left and avg_right:
         cv2.line(debug_frame, (avg_left[0], avg_left[1]), 
-                (avg_left[2], avg_left[3]), (255, 0, 0), 5)
+                 (avg_left[2], avg_left[3]), (255, 0, 0), 5)
         cv2.line(debug_frame, (avg_right[0], avg_right[1]), 
-                (avg_right[2], avg_right[3]), (0, 255, 0), 5)
+                 (avg_right[2], avg_right[3]), (0, 255, 0), 5)
         lane_status = "Both lanes detected"
     elif avg_left or avg_right:
         lane_status = "Partial detection"
@@ -149,8 +165,23 @@ def detect_lanes(frame):
     cv2.putText(debug_frame, f"Final Status: {lane_status}",
                 (10, status_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
                 (0, 255, 0) if lane_status.startswith("Both") else (0,0,255), 2)
+    status_y += line_spacing
 
+    # --- Stage 7: Steering Calculation & Command Dispatch ---
+    steering_angle = 0  # Default: go straight
+    if avg_left and avg_right:
+        lane_center = (avg_left[0] + avg_right[0]) // 2
+        frame_center = width // 2
+        error_px = lane_center - frame_center
+        steering_angle = error_px * 0.01  # Tuning multiplier
+
+    # Send steering command to ESP32-CAM
+    requests.post("http://ESP32_CAM_IP/set_steering", 
+                  json={"angle": steering_angle, "speed": 50})
+
+    # Return the debug frame with all overlays
     return debug_frame
+
 
 @app.route('/upload', methods=['POST'])
 def upload():

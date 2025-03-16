@@ -10,7 +10,6 @@ app = Flask(__name__)
 latest_frame = None
 frame_lock = threading.Lock()
 
-<<<<<<< HEAD
 # Lane detection function
 # def detect_lanes(frame):
 #     """Detects black tape lanes in the frame using edge detection."""
@@ -184,8 +183,6 @@ def detect_lanes(frame):
     return debug_frame
 
 
-=======
->>>>>>> parent of 45221a8 (Add Annotation)
 @app.route('/upload', methods=['POST'])
 def upload():
     global latest_frame

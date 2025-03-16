@@ -4,8 +4,11 @@
 #include "soc/rtc_cntl_reg.h" // Prevents brownout problems
 #include "Arduino.h"
 #include "HTTPClient.h"       // For HTTP POST
-#define CAMERA_MODEL_AI_THINKER 
+#define CAMERA_MODEL_AI_THINKER
 #include "camera_pins.h"
+
+#define ARDUINO_RX 13  // GPIO13 connected to Arduino TX
+#define ARDUINO_TX 12  // GPIO12 connected to Arduino RX
 
 // Replace with your Wi-Fi credentials
 const char* ssid = "SNOWAYTE";
@@ -67,6 +70,9 @@ void setup() {
   }
   Serial.println("\nWiFi connected");
   Serial.println(WiFi.localIP());
+
+  // Initialize Serial1 for communication with the Arduino
+  Serial1.begin(9600, SERIAL_8N1, ARDUINO_RX, ARDUINO_TX);
 }
 
 void loop() {
@@ -87,6 +93,11 @@ void loop() {
     String response = http.getString();
     Serial.print("Server response: ");
     Serial.println(response);
+    
+    // Forward the command to the Arduino if a valid response is received
+    if (response.length() > 0) {
+      Serial1.println(response);
+    }
   } else {
     Serial.print("Error sending POST: ");
     Serial.println(http.errorToString(httpResponseCode));
@@ -96,7 +107,7 @@ void loop() {
   // Release the frame buffer for reuse
   esp_camera_fb_return(fb);
 
-  // Adjust the delay to control frame rate
+  // Adjust the delay to control the frame rate
   delay(100);
 }
 

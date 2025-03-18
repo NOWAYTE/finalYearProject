@@ -3,59 +3,81 @@ import numpy as np
 import cv2
 import threading
 import time
+from ultralytics import YOLO
+import asyncio
+from bleak import BleakClient
+import queue
 
 app = Flask(__name__)
 
-# Global variable to store the latest frame and a lock for thread safety
+# BLE Configuration
+HM10_ADDRESS = "D8:B6:73:0D:B5:A9"
+UUID_SERVICE = "0000FFE0-0000-1000-8000-00805F9B34FB"
+UUID_CHARACTERISTIC = "0000FFE1-0000-1000-8000-00805F9B34FB"
+
+# Global variables
 latest_frame = None
 frame_lock = threading.Lock()
+ble_queue = queue.Queue()
+ble_event = threading.Event()
 
-# Lane detection function
-# def detect_lanes(frame):
-#     """Detects black tape lanes in the frame using edge detection."""
-#     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)  # Convert to grayscale
-#     blur = cv2.GaussianBlur(gray, (5, 5), 0)  # Reduce noise
-#     edges = cv2.Canny(blur, 50, 150)  # Detect edges
-    
-#     # Define a region of interest (ROI)
-#     height, width = frame.shape[:2]
-#     mask = np.zeros_like(edges)
-#     roi = np.array([[
-#         (50, height),  # Bottom-left
-#         (width - 50, height),  # Bottom-right
-#         (width // 2, height // 2)  # Top-center
-#     ]], np.int32)
-#     cv2.fillPoly(mask, roi, 255)
-    
-#     # Apply ROI mask
-#     masked_edges = cv2.bitwise_and(edges, mask)
-    
-#     # Detect lines using Hough Transform
-#     lines = cv2.HoughLinesP(masked_edges, 2, np.pi/180, 100, minLineLength=40, maxLineGap=5)
-    
-#     # Draw detected lanes
-#     lane_image = np.zeros_like(frame)
-#     if lines is not None:
-#         for line in lines:
-#             for x1, y1, x2, y2 in line:
-#                 cv2.line(lane_image, (x1, y1), (x2, y2), (0, 0, 255), 5)
-    
-#     # Overlay detected lanes on the original frame
-#     processed_frame = cv2.addWeighted(frame, 0.8, lane_image, 1, 1)
-#     return processed_frame
+# Load YOLO model
+yolo_model = YOLO("yolov8n.pt")  # Consider yolov8n-seg for smaller model
 
-# In Flask app.py
-steering_data = {"angle": 0, "speed": 0}
+async def ble_consumer():
+    client = None
+    while True:
+        try:
+            if not client or not client.is_connected:
+                client = BleakClient(HM10_ADDRESS)
+                await client.connect()
+                print("BLE Connected")
+            
+            command = await asyncio.to_thread(ble_queue.get, True)
+            await client.write_gatt_char(
+                UUID_CHARACTERISTIC, 
+                command.encode() + b'\n'
+            )
+            print(f"Sent: {command}")
+            
+        except Exception as e:
+            print(f"BLE Error: {e}")
+            await asyncio.sleep(1)
 
-@app.route('/set_steering', methods=['POST'])
-def set_steering():
-    global steering_data
-    steering_data = request.get_json()
-    return "OK", 200
+def ble_background():
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(ble_consumer())
 
-@app.route('/get_steering')
-def get_steering():
-    return jsonify(steering_data)
+# Start BLE thread
+ble_thread = threading.Thread(target=ble_background, daemon=True)
+ble_thread.start()
+
+
+def calculate_steering(frame, avg_left, avg_right, width, height):
+    if avg_left and avg_right:
+        left_x = avg_left[0]  # Bottom x of left lane
+        right_x = avg_right[0]  # Bottom x of right lane
+        lane_center = (left_x + right_x) // 2
+        frame_center = width // 2
+        
+        # Calculate deviation from center and draw a reference line
+        deviation = lane_center - frame_center
+        cv2.line(frame, (frame_center, height), (lane_center, height), (0, 255, 255), 5)
+        
+        # Determine steering command based on deviation thresholds
+        if abs(deviation) < 30:  # Dead zone to prevent jitter
+            return "F"
+        elif deviation > 0:
+            return "F"
+        else:
+            return "F"
+    elif avg_left:
+        return "F"  # Only left lane detected, steer right
+    elif avg_right:
+        return "F"   # Only right lane detected, steer left
+    else:
+        return "F"   # Emergency stop
 
 def detect_lanes(frame):
     """Lane detection with full diagnostic overlay"""
@@ -63,50 +85,40 @@ def detect_lanes(frame):
     debug_frame = frame.copy()
     status_y = 30  # Starting Y-position for status text
     line_spacing = 30
-    
+
     # --- Stage 1: Frame Reception Check ---
-    cv2.putText(debug_frame, f"Frame received: {'Yes' if frame is not None else 'No'}",
-                (10, status_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+    cv2.putText(debug_frame, f"Frame received: Yes", (10, status_y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
     status_y += line_spacing
 
     # --- Stage 2: Edge Detection ---
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
     edges = cv2.Canny(blur, 50, 150)
-    
     edge_pixels = cv2.countNonZero(edges)
-    cv2.putText(debug_frame, f"Edges detected: {edge_pixels} pixels",
-                (10, status_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, 
-                (0, 255, 0) if edge_pixels > 1000 else (0, 0, 255), 2)
+    cv2.putText(debug_frame, f"Edges detected: {edge_pixels} pixels", (10, status_y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0) if edge_pixels > 1000 else (0, 0, 255), 2)
     status_y += line_spacing
 
     # --- Stage 3: ROI Mask Application ---
-    roi_vertices = np.array([[ 
+    roi_vertices = np.array([[
         (int(width * 0.1), height),
         (int(width * 0.9), height),
         (int(width * 0.6), int(height * 0.6)),
         (int(width * 0.4), int(height * 0.6))
     ]], dtype=np.int32)
-    
-    # Draw ROI polygon on debug frame
-    cv2.polylines(debug_frame, roi_vertices, isClosed=True, 
-                 color=(255, 0, 255), thickness=2)
-    cv2.putText(debug_frame, "ROI Applied", (10, status_y), 
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
+    cv2.polylines(debug_frame, roi_vertices, isClosed=True, color=(255, 0, 255), thickness=2)
+    cv2.putText(debug_frame, "ROI Applied", (10, status_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
     status_y += line_spacing
 
     # --- Stage 4: Hough Line Detection ---
     mask = np.zeros_like(edges)
     cv2.fillPoly(mask, roi_vertices, 255)
     masked_edges = cv2.bitwise_and(edges, mask)
-    
-    lines = cv2.HoughLinesP(masked_edges, 2, np.pi/180, 50, 
-                            minLineLength=40, maxLineGap=20)
-    
+    lines = cv2.HoughLinesP(masked_edges, 2, np.pi/180, 50, minLineLength=40, maxLineGap=20)
     line_count = len(lines) if lines is not None else 0
-    cv2.putText(debug_frame, f"Hough lines found: {line_count}",
-                (10, status_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                (0, 255, 0) if line_count > 0 else (0, 0, 255), 2)
+    cv2.putText(debug_frame, f"Hough lines found: {line_count}", (10, status_y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0) if line_count > 0 else (0, 0, 255), 2)
     status_y += line_spacing
 
     # --- Stage 5: Lane Classification ---
@@ -118,24 +130,19 @@ def detect_lanes(frame):
             if x2 == x1: 
                 continue  # Avoid division by zero
             slope = (y2 - y1) / (x2 - x1)
-            
-            # Classify left/right lanes based on slope
-            if slope < -0.5:  # Likely a left lane
+            if slope < -0.5:  # Left lane (negative slope)
                 left_lines.append(line[0])
-            elif slope > 0.5:  # Likely a right lane
+            elif slope > 0.5:  # Right lane (positive slope)
                 right_lines.append(line[0])
-
-    cv2.putText(debug_frame, 
-                f"Left lines: {len(left_lines)} | Right lines: {len(right_lines)}",
+    cv2.putText(debug_frame, f"Left lines: {len(left_lines)} | Right lines: {len(right_lines)}", 
                 (10, status_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                (0, 255, 0) if (len(left_lines)+len(right_lines)) > 0 else (0,0,255), 2)
+                (0, 255, 0) if (len(left_lines)+len(right_lines)) > 0 else (0, 0, 255), 2)
     status_y += line_spacing
 
     # --- Stage 6: Lane Averaging ---
     def average_lines(lines, y_min, y_max):
         if not lines:
             return None
-        # Combine all line points
         x = np.concatenate([[x1, x2] for x1, y1, x2, y2 in lines])
         y = np.concatenate([[y1, y2] for x1, y1, x2, y2 in lines])
         try:
@@ -154,77 +161,78 @@ def detect_lanes(frame):
     # Draw averaged lanes if detected
     lane_status = "No lanes"
     if avg_left and avg_right:
-        cv2.line(debug_frame, (avg_left[0], avg_left[1]), 
-                 (avg_left[2], avg_left[3]), (255, 0, 0), 5)
-        cv2.line(debug_frame, (avg_right[0], avg_right[1]), 
-                 (avg_right[2], avg_right[3]), (0, 255, 0), 5)
+        cv2.line(debug_frame, (avg_left[0], avg_left[1]), (avg_left[2], avg_left[3]), (255, 0, 0), 5)
+        cv2.line(debug_frame, (avg_right[0], avg_right[1]), (avg_right[2], avg_right[3]), (0, 255, 0), 5)
         lane_status = "Both lanes detected"
     elif avg_left or avg_right:
         lane_status = "Partial detection"
+    cv2.putText(debug_frame, f"Final Status: {lane_status}", (10, status_y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0) if lane_status.startswith("Both") else (0, 0, 255), 2)
     
-    cv2.putText(debug_frame, f"Final Status: {lane_status}",
-                (10, status_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                (0, 255, 0) if lane_status.startswith("Both") else (0,0,255), 2)
-    status_y += line_spacing
+    # --- Calculate Steering Command ---
+    command = calculate_steering(debug_frame, avg_left, avg_right, width, height)
+    cv2.putText(debug_frame, f"Command: {command}", (10, status_y + 60),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0) if command == "forward" else (0, 0, 255), 2)
 
-    # --- Stage 7: Steering Calculation & Command Dispatch ---
-    steering_angle = 0  # Default: go straight
-    if avg_left and avg_right:
-        lane_center = (avg_left[0] + avg_right[0]) // 2
-        frame_center = width // 2
-        error_px = lane_center - frame_center
-        steering_angle = error_px * 0.01  # Tuning multiplier
+    # --- YOLO Object Detection ---
+    results = yolo_model(frame)  # Run YOLO on the frame
+    for result in results:
+        boxes = result.boxes.xyxy.cpu().numpy()  # Get bounding boxes
+        confidences = result.boxes.conf.cpu().numpy()  # Get confidence scores
+        class_ids = result.boxes.cls.cpu().numpy()  # Get class IDs
 
-    # Send steering command to ESP32-CAM
-    requests.post("http://ESP32_CAM_IP/set_steering", 
-                  json={"angle": steering_angle, "speed": 50})
+        for box, conf, cls_id in zip(boxes, confidences, class_ids):
+            x1, y1, x2, y2 = map(int, box)
+            label = f"{yolo_model.names[int(cls_id)]} {conf:.2f}"
+            cv2.rectangle(debug_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.putText(debug_frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
-    # Return the debug frame with all overlays
-    return debug_frame
-
+    return debug_frame, command
 
 @app.route('/upload', methods=['POST'])
 def upload():
     global latest_frame
-    # Convert the incoming JPEG byte stream to a numpy array
-    img_array = np.frombuffer(request.data, dtype=np.uint8)
-    # Decode the image using OpenCV
-    frame = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
-    
-    if frame is not None:
+    try:
+        img_array = np.frombuffer(request.data, dtype=np.uint8)
+        frame = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+        
+        if frame is None:
+            return "S", 400
+
+        processed_frame, command = detect_lanes(frame)
+        ble_queue.put(command)  # Send to BLE queue
+        
         with frame_lock:
-            latest_frame = frame
-        return "Frame received", 200
-    else:
-        return "Invalid frame", 400
+            latest_frame = processed_frame
+
+        return command, 200
+    
+    except Exception as e:
+        print(f"Processing error: {e}")
+        return "S", 500
 
 def generate_frames():
     global latest_frame
     while True:
         with frame_lock:
             if latest_frame is None:
-                # Wait for a frame to be available
                 time.sleep(0.1)
                 continue
-            # Encode the frame as JPEG
             ret, buffer = cv2.imencode('.jpg', latest_frame)
         if not ret:
             continue
-        frame = buffer.tobytes()
-        # Yield the frame in the multipart MJPEG format
+        frame_bytes = buffer.tobytes()
         yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
-        time.sleep(0.1)  # Adjust this delay to control the stream frame rate
+               b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+        time.sleep(0.1)
 
 @app.route('/video_feed')
 def video_feed():
-    # Stream the MJPEG frames
     return Response(generate_frames(),
                     mimetype='multipart/x-mixed-replace; boundary=frame')
 
 @app.route('/')
 def index():
-    # A simple HTML page to display the MJPEG stream
     html = '''
     <!doctype html>
     <html>
@@ -240,6 +248,4 @@ def index():
     return render_template_string(html)
 
 if __name__ == '__main__':
-    # Run the Flask server on all network interfaces at port 5000
     app.run(host='0.0.0.0', port=5000, debug=True)
-

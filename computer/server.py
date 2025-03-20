@@ -8,6 +8,7 @@ import asyncio
 from bleak import BleakClient
 import queue
 
+
 app = Flask(__name__)
 
 # BLE Configuration
